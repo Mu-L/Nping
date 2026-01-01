@@ -5,30 +5,51 @@ mod ip_data;
 mod ui;
 mod ping_event;
 mod data_processor;
+mod exporter;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::{task, runtime::Builder};
+use std::time::Duration;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use tokio::{task, runtime::Builder, signal};
 use crate::ip_data::IpData;
 use crate::ping_event::PingEvent;
 use crate::data_processor::start_data_processor;
 use std::sync::mpsc;
 use crate::network::send_ping;
+use crate::exporter::{PrometheusMetrics, http_server, spawn_ping_workers};
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> std::io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
-    version = "v0.5.0",
+    version = "v0.6.0",
     author = "hanshuaikang<https://github.com/hanshuaikang>",
     about = "🏎  Nping mean NB Ping, A Ping Tool in Rust with Real-Time Data and Visualizations"
 )]
 struct Args {
     /// Target IP address or hostname to ping
-    #[arg(help = "target IP address or hostname to ping", required = true)]
+    #[arg(help = "target IP address or hostname to ping", required = false)]
     target: Vec<String>,
 
     /// Number of pings to send, when count is 0, the maximum number of pings per address is calculated
-    #[arg(short, long, default_value_t = 65535, help = "Number of pings to send")]
+    #[arg(short, long, default_value_t = 0, help = "Number of pings to send")]
     count: usize,
 
     /// Interval in seconds between pings
@@ -51,6 +72,27 @@ struct Args {
 
     #[arg(short = 'o', long = "output", help = "Output file to save ping results")]
     output: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Exporter mode for monitoring
+    Exporter {
+        /// Target IP addresses or hostnames to ping
+        #[arg(help = "target IP addresses or hostnames to ping", required = true)]
+        target: Vec<String>,
+
+        /// Interval in seconds between pings
+        #[arg(short, long, default_value_t = 1, help = "Interval in seconds between pings")]
+        interval: i32,
+
+        /// Prometheus metrics HTTP port
+        #[arg(short, long, default_value_t = 9090, help = "Prometheus metrics HTTP port")]
+        port: u16,
+    },
 }
 
 
@@ -58,45 +100,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
 
-    // set Ctrl+C and q and esc to exit
-    let running = Arc::new(Mutex::new(true));
+    match args.command {
+        Some(Commands::Exporter { target, interval, port }) => {
+            let worker_threads = (target.len() + 1).max(1);
+            // Create tokio runtime for Exporter mode
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
 
-    // check output file
-    if let Some(ref output_path) = args.output {
-        if std::path::Path::new(output_path).exists() {
-            eprintln!("Output file already exists: {}", output_path);
-            std::process::exit(1);
+            let res = rt.block_on(run_exporter_mode(target, interval, port));
+
+            // if error print error message and exit
+            if let Err(err) = res {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            // Default ping mode
+            if args.target.is_empty() {
+                eprintln!("Error: target IP address or hostname is required");
+                std::process::exit(1);
+            }
+
+            // set Ctrl+C and q and esc to exit
+            let running = Arc::new(Mutex::new(true));
+
+            // check output file
+            if let Some(ref output_path) = args.output {
+                if std::path::Path::new(output_path).exists() {
+                    eprintln!("Output file already exists: {}", output_path);
+                    std::process::exit(1);
+                }
+            }
+
+            // after de-duplication, the original order is still preserved
+            let mut seen = HashSet::new();
+            let targets: Vec<String> = args.target.into_iter()
+                .filter(|item| seen.insert(item.clone()))
+                .collect();
+
+            // Calculate worker threads based on IP count
+            let ip_count = if targets.len() == 1 && args.multiple > 0 {
+                args.multiple as usize
+            } else {
+                targets.len()
+            };
+            let worker_threads = (ip_count +  1).max(1);
+
+            // Create tokio runtime with specific worker thread count
+            let rt = Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()?;
+
+            let res = rt.block_on(run_app(targets, args.count, args.interval, running.clone(), args.force_ipv6, args.multiple, args.view_type, args.output));
+
+            // if error print error message and exit
+            if let Err(err) = res {
+                eprintln!("{}", err);
+                std::process::exit(1);
+            }
         }
-    }
-
-
-
-    // after de-duplication, the original order is still preserved
-    let mut seen = HashSet::new();
-    let targets: Vec<String> = args.target.into_iter()
-        .filter(|item| seen.insert(item.clone()))
-        .collect();
-
-    // Calculate worker threads based on IP count
-    let ip_count = if targets.len() == 1 && args.multiple > 0 {
-        args.multiple as usize
-    } else {
-        targets.len()
-    };
-    let worker_threads = (ip_count +  1).max(1);
-
-    // Create tokio runtime with specific worker thread count
-    let rt = Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()?;
-
-    let res = rt.block_on(run_app(targets, args.count, args.interval, running.clone(), args.force_ipv6, args.multiple, args.view_type, args.output));
-
-    // if error print error message and exit
-    if let Err(err) = res {
-        eprintln!("{}", err);
-        std::process::exit(1);
     }
     Ok(())
 }
@@ -241,6 +307,146 @@ async fn run_app(
     
     // restore terminal
     draw::restore_terminal(&mut terminal_guard.lock().unwrap().terminal.as_mut().unwrap())?;
+
+    Ok(())
+}
+
+async fn run_exporter_mode(
+    targets: Vec<String>,
+    interval: i32,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 创建 Prometheus metrics 收集器
+    let prometheus_metrics = Arc::new(PrometheusMetrics::new()?);
+
+    // 创建信号处理通道
+    let running = Arc::new(AtomicBool::new(true));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+
+    // 设置信号处理
+    let running_for_signal = running.clone();
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                println!("\nReceived Ctrl+C, shutting down gracefully...");
+                running_for_signal.store(false, Ordering::Relaxed);
+                
+                // 发送关闭信号给 HTTP 服务器
+                if let Some(tx) = shutdown_tx_for_signal.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
+    });
+
+    // 去重目标地址，同时保留原始顺序
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<String> = targets.into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect();
+
+    if targets.is_empty() {
+        return Err("No valid targets provided".into());
+    }
+
+    // 解析目标地址为 IP 地址
+    let mut target_pairs = Vec::new();
+    for target in &targets {
+        let ip = network::get_host_ipaddr(target, false)?;
+        target_pairs.push((target.clone(), ip));
+    }
+
+    println!("🚀 NPing Prometheus Exporter Mode Started");
+    println!("┌─────────────────────────────────────────────────────────");
+    println!("│ Targets     : {} host(s)", targets.len());
+    for (i, target) in targets.iter().enumerate() {
+        if i < 5 {
+            println!("│             : {}", target);
+        } else if i == 5 {
+            println!("│             : ... ({} more)", targets.len() - 5);
+            break;
+        }
+    }
+    println!("│ Interval    : {} seconds", interval);
+    println!("│ Metrics port: {}", port);
+    println!("│ Metrics     : http://0.0.0.0:{}/metrics", port);
+    println!("│ Actions     : Press Ctrl+C or q to stop");
+    println!("└─────────────────────────────────────────────────────────");
+
+    // 启动 HTTP metrics 服务器
+    let metrics_addr = format!("0.0.0.0:{}", port).parse()?;
+    let metrics_for_server = prometheus_metrics.clone();
+    let metrics_task = task::spawn(async move {
+        http_server::start_metrics_server(
+            metrics_for_server,
+            metrics_addr,
+            shutdown_rx,
+        ).await
+    });
+
+    let interval_ms = interval * 1000;
+    let ping_threads = spawn_ping_workers(
+        target_pairs,
+        Duration::from_millis(interval_ms as u64),
+        running.clone(),
+        prometheus_metrics.clone(),
+    );
+
+    // Listen for q/esc to exit (exporter mode only)
+    let running_for_key = running.clone();
+    let shutdown_tx_for_key = shutdown_tx.clone();
+    let key_listener = std::thread::spawn(move || {
+        let _raw_mode = match RawModeGuard::new() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        while running_for_key.load(Ordering::Relaxed) {
+            if let Ok(true) = event::poll(Duration::from_millis(50)) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            running_for_key.store(false, Ordering::Relaxed);
+                            if let Some(tx) = shutdown_tx_for_key.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                            running_for_key.store(false, Ordering::Relaxed);
+                            if let Some(tx) = shutdown_tx_for_key.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for metrics server to shut down
+    let metrics_result = metrics_task.await?;
+    let metrics_error = metrics_result.err();
+
+    running.store(false, Ordering::Relaxed);
+
+    // Wait for ping threads to complete
+    for handle in ping_threads {
+        let _ = handle.join();
+    }
+
+    let _ = key_listener.join();
+
+    if let Some(err) = metrics_error {
+        return Err(err);
+    }
 
     Ok(())
 }
